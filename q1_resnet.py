@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.optim as optim
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 from sklearn.metrics import precision_score, recall_score, f1_score
@@ -20,19 +19,28 @@ class ResNetBlock(nn.Module):
         # Hint: Lookup nn.Conv2d, nn.BatchNorm2d, and nn.ReLU
         self.downsample = downsample
         
-        raise NotImplementedError
+        self.model = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, stride=stride, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+        )
+        self.final_relu = nn.ReLU()
 
     def forward(self, x):
         identity = x
         out = None
         
         # TODO: fill the forward based on the provided specification
+        out = self.model(x)
         
         # keep this as is
         if self.downsample is not None:
             identity = self.downsample(x)
     
         out += identity
+        out = self.final_relu(out)
         return out
 
 class ResNet(nn.Module):
@@ -41,7 +49,12 @@ class ResNet(nn.Module):
         
         # layer A
         # TODO: initialise the following correctly based on the provided specification 
-        self.layerA = None
+        self.layerA = nn.Sequential(
+            nn.Conv2d(3, 64, 7, stride=2, padding=3, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(3, stride=2, padding=1),
+        )
 
         # layer B
         self.layerB = self.make_resnet_layer(in_channels=64, out_channels=64, blocks=layers[0], stride=1)
@@ -59,6 +72,17 @@ class ResNet(nn.Module):
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Linear(512, num_classes)
 
+        self.model = nn.Sequential(
+            self.layerA,
+            self.layerB,
+            self.layerC,
+            self.layerD,
+            self.layerE,
+            self.avgpool,
+            nn.Flatten(),
+            self.fc,
+        )
+
     def make_resnet_layer(self, in_channels, out_channels, blocks, stride):
         downsample = None
         
@@ -66,23 +90,26 @@ class ResNet(nn.Module):
             # i.e. the dimensions of F(x) and x are different, i.e. skip connection can't be a simple addition
             # TODO: fill the downsample with the apt convolution and batchnorm
             # Hint: lookup nn.Sequential
-            downsample = None
+            downsample = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels),
+            )
         
         resnet_blocks_list = [] # list of ResNetBlock blocks that comprise this layer
         
         # consider the first block (special case because it could have stride, downsample)
         # TODO: initialise and append the correct ResNetBlock
-        resnet_blocks_list.append(None)
+        resnet_blocks_list.append(ResNetBlock(in_channels, out_channels, stride=stride, downsample=downsample))
         
         # TODO: initialise and append the correct ResNetBlock based on the provided specification
         for _ in range(1, blocks):
-            resnet_blocks_list.append(None)
+            resnet_blocks_list.append(ResNetBlock(out_channels, out_channels))
             
         return nn.Sequential(*resnet_blocks_list)
 
     def forward(self, x):
         # TODO: fill the forward based on the provided specification
-        raise NotImplementedError
+        return self.model(x)
 
 def resnet18(num_classes=10):
   return ResNet([2, 2, 2, 2], num_classes)
@@ -94,13 +121,40 @@ def get_metrics(model, data_loader, device, criterion):
     # Note: Use precision_score, recall_score, f1_score functions from sklearn.metrics to calculate metrics
     # https://scikit-learn.org/1.5/modules/generated/sklearn.metrics.f1_score.html
     # set average='weighted' for the sklearn functions
+    tot_num_batches = 0
+    tot_data = 0
+    tot_batch_loss = 0
+    tot_correct = 0
+
+    y_true = []
+    y_pred = []
+
+    with torch.no_grad():
+        for inputs, labels in tqdm(data_loader, desc="eval"):   
+            inputs, labels = inputs.to(device), labels.to(device)
+            logits = model(inputs)
+            loss = criterion(logits, labels)
+
+            tot_batch_loss += loss.item()
+            tot_num_batches += 1
+            tot_data += inputs.shape[0]
+            preds = torch.argmax(logits, dim=-1)
+            tot_correct += torch.sum(preds == labels).item()
+
+            y_true += labels.cpu().tolist()
+            y_pred += preds.cpu().tolist()
+    
+    accuracy = tot_correct / tot_data
+    avg_batch_loss = tot_batch_loss / tot_num_batches
+    f1 = f1_score(y_true, y_pred, average="weighted")
+    precision = precision_score(y_true, y_pred, average="weighted")
+    recall = recall_score(y_true, y_pred, average="weighted")
     
     # Note: use the torch.no_grad() to create a context where grads of the operations aren't kept track of
     # Return: (accuracy, avg_batch_loss, f1_score, precision, recall)
-    raise NotImplementedError
+    return accuracy, avg_batch_loss, f1, precision, recall
 
-if __name__ == '__main__':
-    
+def train(momentum: float = 0):
     # Load the CIFAR10 dataset 
     transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean=[0.4914, 0.4822, 0.4465], 
                                                                                 std=[0.2023, 0.1994, 0.2010])])
@@ -114,6 +168,8 @@ if __name__ == '__main__':
     
     # Assign the device to be used for the compute
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    if torch.mps.is_available():
+        device = "mps"
     
     # Create the model
     model = resnet18(num_classes=10).to(device)
@@ -121,7 +177,7 @@ if __name__ == '__main__':
     # Define loss function and optimizer
     # TODO: change momentum in the optimizer as asked
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.01, weight_decay = 0.001) 
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01, weight_decay=0.001, momentum=momentum)
     
     # Train the model
     num_epochs = 20
@@ -149,7 +205,17 @@ if __name__ == '__main__':
             
             # TODO: fill in missing code here to complete the training logic
             # Note: remember to update the accumulator variables
-            pass
+            optimizer.zero_grad()
+            logits = model(inputs)
+            loss = criterion(logits, labels)
+            loss.backward()
+            optimizer.step()
+
+            tot_num_batches += 1
+            tot_data += inputs.shape[0]
+            tot_batch_loss += loss.item()
+            preds = torch.argmax(logits, dim=-1)
+            tot_correct += torch.sum(preds == labels).item()
         
         # Compute the average batch loss + accuracy for the train dataset
         avg_batch_loss = tot_batch_loss / tot_num_batches
@@ -159,9 +225,27 @@ if __name__ == '__main__':
         # Compute the average batch loss + accuracy for the test dataset
         avg_te_acc, avg_te_batch_loss, _, _, _ = get_metrics(model, test_loader, device, criterion)
         print(f'Epoch {epoch+1} Test Loss: {avg_te_batch_loss} Acc: {avg_te_acc}')    
+
         # TODO: Modify the trajectories
+        tr_loss_trajectory.append(avg_batch_loss)
+        tr_acc_trajectory.append(avg_batch_acc)
+        te_loss_trajectory.append(avg_te_batch_loss)
+        te_acc_trajectory.append(avg_te_acc)
     
-    avg_te_acc, avg_te_batch_loss, precision, recall, f1_score = get_metrics(model, test_loader, device, criterion)
-    print(f'Test Loss: {avg_te_batch_loss} Acc: {avg_te_acc} Precision: {precision} Recall: {recall} F1 Score: {f1_score}')
+    avg_te_acc, avg_te_batch_loss, f1, precision, recall = get_metrics(model, test_loader, device, criterion)
+    print(f'Test Loss: {avg_te_batch_loss} Acc: {avg_te_acc} Precision: {precision} Recall: {recall} F1 Score: {f1}')
+
     # TODO: Save the trajectories (so as to be plotted later)
-    
+    return {
+        "train_loss": tr_loss_trajectory,
+        "train_acc": tr_acc_trajectory,
+        "test_loss": te_loss_trajectory,
+        "test_acc": te_acc_trajectory,
+        "f1_score": f1,
+        "precision": precision,
+        "recall": recall,
+    }
+
+
+if __name__ == "__main__":
+    train()
